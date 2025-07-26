@@ -1,31 +1,34 @@
-#JANELA INICIAL DE MENU:
-
-print ('Seja bem vindo a pizzaria Jovax!')
-print ('MENU:')
-print ('1: Cardapio.')
-print ('2: Sair.')
-cardapio = input()
-
-#JANELA DE CARDAPIO:
-if cardapio =='1':
-    print('Cardapio:')
-    print ('Pizza quatro queijos:R$ 50,00')
-    print ('Pizza peperone:R$ 50,00')
-    print ('Pizza camarao:R$ 70,00')
-    print ('Pizza portugueza:R$ 50,00')
-    
-    sabores = ['quatro queijos','peperone','camarao','portuguesa']
-    pedido = input('Digite seu pedido:')
-    pedido = pedido.lower()
-    sabores_escolhidos = []
-    valor = []
-    if pedido == sabores[2]:
-         valor = ('70.00')
+opçao = ''
+while opçao != '1' and opçao != '2':
+    print ('SEJA BEM VINDO PIZZARIA JOVAX!')
+    opçao = input('Digite 1 para ir para o cardapio:').strip()
+    if opçao == '1':
+        
+                        # Aqui começa janela de cardapio:
+        finalizar = ''# '1'para pedido.
+        cardapio = ['camarao','quatro queijos','peperone','frango']
+        pedido = ['']
+        while finalizar != '1':
+            print ('         CARDAPIO DO DIA!')
+            print ('')
+            print ('Faça seu pedido e digite 1 para finalizar:')
+            print ('')
+            print ('Pizza de camarao: R$ 70.00')
+            print ('Pizza de quatro queijos R$ 50.00')
+            print ('Pizza de peperone R$ 50.00')
+            print ('Pizza de frango R$ 50.00')
+            pedido = input('Pizza de:').strip().lower()
+            if pedido in cardapio:
+                print ('                     ',pedido)
+        
+        
+        
+        
+        
+        
+        
+        
+    elif opçao == '2':
+        print ('FINALIZANDO SISTEMA!')
     else:
-         valor = ('50.00')
-    if pedido in sabores:
-         sabores_escolhidos = pedido
-         print ('Pedido:'sabores_escolhidos)
-         
-    else:
-        print ('entrada invalida!')
+        print ('ENTRADA INVALIDA!')
