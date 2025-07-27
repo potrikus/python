@@ -1,11 +1,13 @@
 opçao = ''
 lista = []
+valor = []
 while opçao != '1' and opçao != '2':
     print('SEJA BEM VINDO PIZZARIA JOVAX!')
     opçao = input('Digite 1 para ir para o cardapio:').strip()
     if opçao == '1':
 
         # Aqui começa janela de cardapio:
+        #---------------------------------------------------------------------------------
         finalizar = ''  # '1'para pedido.
         cardapio = ['camarao', 'quatro queijos', 'peperone', 'frango']
 
@@ -26,8 +28,18 @@ while opçao != '1' and opçao != '2':
                lista.append(pedido)
             else:
               print ('Item nao encontrado!')
-            print(lista)
 
+            #   Inicio de apontamento de valores
+            #---------------------------------------------------------------------------
+            # valor[]
+            if pedido == 'camarao':
+                valor.append(70.00)
+            else:
+                valor.append(50.00)
+
+            print (lista)
+            print (valor)
+           #---------------------------------------------------------------------------------------------
 
 
 
