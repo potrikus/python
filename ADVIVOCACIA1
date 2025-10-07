@@ -1,0 +1,816 @@
+# men.py
+"""
+Men (Sistema de Advocacia) - versão consolidada e corrigida
+- Arquivo único (substitui seu men.py atual)
+- Login com bcrypt, admin criado automaticamente
+- Verificações/migrations automáticas do banco (adiciona colunas que faltarem)
+- UI moderno (PyQt5) com menu lateral, logo desenhado dinamicamente
+- Módulos: Clientes, Processos, Agenda, Financeiro, Relatórios, Usuários
+- Export CSV/Excel e geração de PDF com logo
+- Não reinicia o banco; trabalha sobre advogacia.db
+Requisitos:
+pip install PyQt5 reportlab bcrypt xlsxwriter
+"""
+
+import sys
+import os
+import sqlite3
+import tempfile
+import csv
+import bcrypt
+from datetime import datetime
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QDialog, QLabel, QLineEdit, QPushButton,
+    QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+    QMessageBox, QStackedWidget, QComboBox, QTextEdit, QDateEdit, QTimeEdit,
+    QFileDialog, QFrame, QSizePolicy, QInputDialog
+)
+from PyQt5.QtGui import QFont, QPixmap, QPainter, QColor
+from PyQt5.QtCore import Qt
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+
+# Optional excel export
+try:
+    import xlsxwriter
+    HAVE_XLSXWRITER = True
+except Exception:
+    HAVE_XLSXWRITER = False
+
+DB_FILE = "advocacia.db"
+FIRM_NAME = "Soares e Tricheis Advocacia e Consultoria Jurídica"
+
+# -------------------------
+# Database helpers + migrations
+# -------------------------
+def conectar():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    return conn, cursor
+
+def ensure_tables_and_columns():
+    """
+    Garante que as tabelas básicas existam e aplica pequenas migrations (add column).
+    Não remove nada — apenas cria tabelas/colunas faltantes.
+    """
+    conn, cur = conectar()
+    # Base table creation (safe if exists)
+    cur.execute("""CREATE TABLE IF NOT EXISTS usuarios (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nome TEXT,
+                    login TEXT UNIQUE,
+                    senha TEXT,
+                    nivel TEXT
+                   )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS clientes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nome TEXT,
+                    cpf_cnpj TEXT,
+                    telefone TEXT,
+                    email TEXT,
+                    endereco TEXT
+                   )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS processos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cliente_id INTEGER,
+                    numero TEXT,
+                    tipo TEXT,
+                    status TEXT,
+                    data_abertura TEXT
+                   )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS agenda (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    titulo TEXT,
+                    descricao TEXT,
+                    data TEXT,
+                    hora TEXT
+                   )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS financeiro (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    descricao TEXT,
+                    tipo TEXT,
+                    valor REAL,
+                    data TEXT
+                   )""")
+    conn.commit()
+
+    # helper to test column presence
+    def has_column(table, column):
+        cur.execute(f"PRAGMA table_info({table})")
+        return column in [r[1] for r in cur.fetchall()]
+
+    # migrations: add descricao to processos if missing
+    if not has_column("processos", "descricao"):
+        try:
+            cur.execute("ALTER TABLE processos ADD COLUMN descricao TEXT")
+            print("[migrations] added column 'descricao' to processos")
+        except Exception as e:
+            print("[migrations] could not add descricao:", e)
+
+    # ensure usuarios.nivel exists
+    if not has_column("usuarios", "nivel"):
+        try:
+            cur.execute("ALTER TABLE usuarios ADD COLUMN nivel TEXT")
+            print("[migrations] added column 'nivel' to usuarios")
+        except Exception as e:
+            print("[migrations] could not add nivel:", e)
+
+    conn.commit()
+    conn.close()
+
+def ensure_admin_user():
+    conn, cur = conectar()
+    cur.execute("SELECT id FROM usuarios WHERE login='admin'")
+    if not cur.fetchone():
+        hashed = bcrypt.hashpw("admin".encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        cur.execute("INSERT INTO usuarios (nome, login, senha, nivel) VALUES (?, ?, ?, ?)",
+                    ("Administrador", "admin", hashed, "admin"))
+        conn.commit()
+        print("Admin user created: login=admin senha=admin")
+    conn.close()
+
+# -------------------------
+# Logo generation (dynamic)
+# -------------------------
+def create_logo_pixmap(width=360, height=90):
+    pix = QPixmap(width, height)
+    pix.fill(Qt.white)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+    navy = QColor(16,44,85)
+    grey = QColor(110,120,130)
+    p.setBrush(navy)
+    p.setPen(Qt.NoPen)
+    # stylized blocks (monogram hint)
+    p.drawRoundedRect(12, 10, 60, 60, 10, 10)
+    p.setBrush(grey)
+    p.drawRoundedRect(68, 20, 48, 40, 8, 8)
+    # text
+    p.setPen(navy)
+    font = QFont("Times", 14, QFont.Bold)
+    p.setFont(font)
+    p.drawText(130, 36, "Soares e Tricheis")
+    font2 = QFont("Arial", 9)
+    p.setFont(font2)
+    p.setPen(grey)
+    p.drawText(130, 58, "Advocacia e Consultoria Jurídica")
+    p.end()
+    return pix
+
+def save_pixmap_tempfile(pix):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    path = tmp.name
+    tmp.close()
+    pix.save(path, "PNG")
+    return path
+
+# -------------------------
+# GUI: Login
+# -------------------------
+class LoginDialog(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"Login - {FIRM_NAME}")
+        self.setFixedSize(420, 220)
+        self.setup_ui()
+
+    def setup_ui(self):
+        self.setStyleSheet("background-color:#f2f6fc;")
+        v = QVBoxLayout()
+        title = QLabel(FIRM_NAME)
+        title.setFont(QFont("Arial", 13, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        v.addWidget(title)
+        v.addSpacing(6)
+        v.addWidget(QLabel("Login:"))
+        self.input_user = QLineEdit()
+        self.input_user.setPlaceholderText("login")
+        v.addWidget(self.input_user)
+        v.addWidget(QLabel("Senha:"))
+        self.input_pass = QLineEdit()
+        self.input_pass.setEchoMode(QLineEdit.Password)
+        self.input_pass.setPlaceholderText("senha")
+        v.addWidget(self.input_pass)
+        btn_h = QHBoxLayout()
+        btn_login = QPushButton("Entrar")
+        btn_login.setStyleSheet("background:#2e86c1;color:white;height:36px;border-radius:6px;font-weight:bold;")
+        btn_login.clicked.connect(self.try_login)
+        btn_reset = QPushButton("Reset admin")
+        btn_reset.setStyleSheet("background:#95a5a6;color:white;height:28px;border-radius:6px;")
+        btn_reset.clicked.connect(self.reset_admin)
+        btn_h.addWidget(btn_login); btn_h.addWidget(btn_reset)
+        v.addLayout(btn_h)
+        self.setLayout(v)
+
+    def try_login(self):
+        user = self.input_user.text().strip()
+        pwd = self.input_pass.text().strip()
+        if not user or not pwd:
+            QMessageBox.warning(self, "Erro", "Informe login e senha.")
+            return
+        conn, cur = conectar()
+        cur.execute("SELECT senha FROM usuarios WHERE login=?", (user,))
+        row = cur.fetchone()
+        conn.close()
+        if row and bcrypt.checkpw(pwd.encode('utf-8'), row[0].encode('utf-8')):
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Erro", "Login ou senha incorretos.")
+
+    def reset_admin(self):
+        conn, cur = conectar()
+        hashed = bcrypt.hashpw("admin".encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        cur.execute("SELECT id FROM usuarios WHERE login='admin'")
+        if cur.fetchone():
+            cur.execute("UPDATE usuarios SET senha=? WHERE login='admin'", (hashed,))
+        else:
+            cur.execute("INSERT INTO usuarios (nome,login,senha,nivel) VALUES (?,?,?,?)",
+                        ("Administrador","admin",hashed,"admin"))
+        conn.commit(); conn.close()
+        QMessageBox.information(self, "OK", "Senha admin definida para 'admin' (hasheada).")
+
+# -------------------------
+# GUI: Main Application
+# -------------------------
+class AdvocaciaApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"{FIRM_NAME} — Sistema")
+        self.resize(1250, 760)
+        self.logo_pixmap = create_logo_pixmap(360, 90)
+        self.logo_tmp_path = save_pixmap_tempfile(self.logo_pixmap)
+        self.setup_ui()
+        # initial load methods
+        self.refresh_all()
+
+    def setup_ui(self):
+        self.setStyleSheet("background-color:#f7f9fc; font-family: Arial;")
+        main = QHBoxLayout(); self.setLayout(main)
+
+        # Side menu
+        side = QFrame(); side.setFixedWidth(220)
+        side.setStyleSheet("background:#203041; border-radius:8px; padding:10px;")
+        sl = QVBoxLayout(); sl.setAlignment(Qt.AlignTop)
+        logo_label = QLabel(); logo_label.setPixmap(self.logo_pixmap.scaledToWidth(180, Qt.SmoothTransformation)); logo_label.setAlignment(Qt.AlignCenter)
+        sl.addWidget(logo_label); sl.addSpacing(6)
+        btn_style = "background:#2d6ca2;color:white;height:44px;border-radius:8px;font-weight:bold;"
+        self.btn_clients = QPushButton("Clientes"); self.btn_clients.setStyleSheet(btn_style)
+        self.btn_processos = QPushButton("Processos"); self.btn_processos.setStyleSheet(btn_style)
+        self.btn_agenda = QPushButton("Agenda"); self.btn_agenda.setStyleSheet(btn_style)
+        self.btn_financeiro = QPushButton("Financeiro"); self.btn_financeiro.setStyleSheet(btn_style)
+        self.btn_relatorios = QPushButton("Relatórios"); self.btn_relatorios.setStyleSheet(btn_style)
+        sl.addWidget(self.btn_clients); sl.addSpacing(6)
+        sl.addWidget(self.btn_processos); sl.addSpacing(6)
+        sl.addWidget(self.btn_agenda); sl.addSpacing(6)
+        sl.addWidget(self.btn_financeiro); sl.addSpacing(6)
+        sl.addWidget(self.btn_relatorios); sl.addStretch()
+        side.setLayout(sl)
+        main.addWidget(side)
+
+        # stacked
+        self.stacked = QStackedWidget(); main.addWidget(self.stacked)
+
+        # pages
+        self.page_clients(); self.page_processos(); self.page_agenda(); self.page_finance(); self.page_reports()
+
+        # connect buttons
+        self.btn_clients.clicked.connect(lambda: self.stacked.setCurrentIndex(0))
+        self.btn_processos.clicked.connect(lambda: self.stacked.setCurrentIndex(1))
+        self.btn_agenda.clicked.connect(lambda: self.stacked.setCurrentIndex(2))
+        self.btn_financeiro.clicked.connect(lambda: self.stacked.setCurrentIndex(3))
+        self.btn_relatorios.clicked.connect(lambda: self.stacked.setCurrentIndex(4))
+
+    # ---------------- Clients page ----------------
+    def page_clients(self):
+        w = QWidget(); layout = QVBoxLayout(); layout.setContentsMargins(12,12,12,12)
+        hdr = QLabel("Clientes"); hdr.setFont(QFont("Arial", 16, QFont.Bold)); layout.addWidget(hdr)
+        form = QHBoxLayout()
+        self.c_nome = QLineEdit(); self.c_nome.setPlaceholderText("Nome completo")
+        self.c_cpf = QLineEdit(); self.c_cpf.setPlaceholderText("CPF / CNPJ")
+        self.c_tel = QLineEdit(); self.c_tel.setPlaceholderText("Telefone")
+        self.c_email = QLineEdit(); self.c_email.setPlaceholderText("E-mail")
+        self.c_end = QLineEdit(); self.c_end.setPlaceholderText("Endereço")
+        btn_save = QPushButton("Salvar Cliente"); btn_save.setStyleSheet("background:#27ae60;color:white;border-radius:6px;height:34px;")
+        btn_save.clicked.connect(self.save_client)
+        for wgt in (self.c_nome, self.c_cpf, self.c_tel, self.c_email, self.c_end, btn_save):
+            form.addWidget(wgt)
+        layout.addLayout(form)
+        actions = QHBoxLayout()
+        btn_edit = QPushButton("Editar selecionado"); btn_delete = QPushButton("Excluir selecionado")
+        btn_edit.clicked.connect(self.edit_client); btn_delete.clicked.connect(self.delete_client)
+        actions.addWidget(btn_edit); actions.addWidget(btn_delete); layout.addLayout(actions)
+        self.tbl_clients = QTableWidget(); self.tbl_clients.setColumnCount(6)
+        self.tbl_clients.setHorizontalHeaderLabels(["ID","Nome","CPF/CNPJ","Telefone","E-mail","Endereço"])
+        self.tbl_clients.setAlternatingRowColors(True); layout.addWidget(self.tbl_clients)
+        w.setLayout(layout); self.stacked.addWidget(w)
+
+    def save_client(self):
+        nome = self.c_nome.text().strip(); cpf = self.c_cpf.text().strip()
+        if not nome or not cpf:
+            QMessageBox.warning(self, "Erro", "Nome e CPF/CNPJ obrigatórios.")
+            return
+        tel = self.c_tel.text().strip(); email = self.c_email.text().strip(); end = self.c_end.text().strip()
+        try:
+            conn, cur = conectar(); cur.execute("INSERT INTO clientes (nome,cpf_cnpj,telefone,email,endereco) VALUES (?,?,?,?,?)",(nome,cpf,tel,email,end)); conn.commit(); conn.close()
+            self.c_nome.clear(); self.c_cpf.clear(); self.c_tel.clear(); self.c_email.clear(); self.c_end.clear()
+            self.load_clients(); self.load_process_clients_combo(); QMessageBox.information(self, "Sucesso", "Cliente salvo.")
+        except sqlite3.IntegrityError:
+            QMessageBox.warning(self, "Erro", "CPF/CNPJ já cadastrado.")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", str(e))
+
+    def load_clients(self):
+        conn, cur = conectar(); cur.execute("SELECT * FROM clientes ORDER BY nome"); rows = cur.fetchall(); conn.close()
+        self.tbl_clients.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            for j, val in enumerate(r):
+                item = QTableWidgetItem(str(val)); item.setFlags(item.flags() ^ Qt.ItemIsEditable); self.tbl_clients.setItem(i, j, item)
+        self.tbl_clients.resizeColumnsToContents()
+
+    def edit_client(self):
+        row = self.tbl_clients.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Aviso", "Selecione um cliente.")
+            return
+        cid = self.tbl_clients.item(row,0).text()
+        conn, cur = conectar(); cur.execute("SELECT nome,cpf_cnpj,telefone,email,endereco FROM clientes WHERE id=?", (cid,)); rec = cur.fetchone(); conn.close()
+        if not rec:
+            QMessageBox.warning(self, "Erro", "Cliente não encontrado."); return
+        dlg = QDialog(self); dlg.setWindowTitle("Editar Cliente"); dlg.setFixedSize(700,260)
+        v = QVBoxLayout(); e_nome = QLineEdit(rec[0]); e_cpf = QLineEdit(rec[1]); e_tel = QLineEdit(rec[2]); e_email = QLineEdit(rec[3]); e_end = QLineEdit(rec[4])
+        v.addWidget(QLabel("Nome:")); v.addWidget(e_nome); v.addWidget(QLabel("CPF/CNPJ:")); v.addWidget(e_cpf)
+        v.addWidget(QLabel("Telefone:")); v.addWidget(e_tel); v.addWidget(QLabel("E-mail:")); v.addWidget(e_email); v.addWidget(QLabel("Endereço:")); v.addWidget(e_end)
+        h = QHBoxLayout(); ok = QPushButton("Atualizar"); cancel = QPushButton("Cancelar")
+        ok.clicked.connect(lambda: self.do_update_client(cid, e_nome.text(), e_cpf.text(), e_tel.text(), e_email.text(), e_end.text(), dlg)); cancel.clicked.connect(dlg.reject)
+        h.addWidget(ok); h.addWidget(cancel); v.addLayout(h); dlg.setLayout(v); dlg.exec_()
+
+    def do_update_client(self, cid, nome, cpf, tel, email, end, dlg):
+        if not nome.strip() or not cpf.strip():
+            QMessageBox.warning(dlg, "Erro", "Nome e CPF obrigatórios."); return
+        try:
+            conn, cur = conectar(); cur.execute("UPDATE clientes SET nome=?, cpf_cnpj=?, telefone=?, email=?, endereco=? WHERE id=?", (nome.strip(), cpf.strip(), tel.strip(), email.strip(), end.strip(), cid)); conn.commit(); conn.close(); dlg.accept(); self.load_clients(); self.load_process_clients_combo(); QMessageBox.information(self, "Sucesso", "Cliente atualizado.")
+        except sqlite3.IntegrityError:
+            QMessageBox.warning(dlg, "Erro", "CPF/CNPJ já cadastrado.")
+        except Exception as e:
+            QMessageBox.critical(dlg, "Erro", str(e))
+
+    def delete_client(self):
+        row = self.tbl_clients.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Aviso", "Selecione um cliente.")
+            return
+        cid = self.tbl_clients.item(row,0).text()
+        if QMessageBox.question(self, "Confirmar", "Excluir cliente? Isso não removerá processos relacionados automaticamente.") != QMessageBox.Yes:
+            return
+        try:
+            conn, cur = conectar(); cur.execute("DELETE FROM clientes WHERE id=?", (cid,)); conn.commit(); conn.close(); self.load_clients(); self.load_process_clients_combo(); QMessageBox.information(self, "Sucesso", "Cliente excluído.")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", str(e))
+
+    # ---------------- Processes page ----------------
+    def page_processos(self):
+        w = QWidget(); layout = QVBoxLayout(); layout.setContentsMargins(12,12,12,12)
+        hdr = QLabel("Processos"); hdr.setFont(QFont("Arial", 16, QFont.Bold)); layout.addWidget(hdr)
+        form = QHBoxLayout()
+        self.p_cliente = QComboBox()
+        self.p_num = QLineEdit(); self.p_num.setPlaceholderText("Número do processo")
+        self.p_tipo = QLineEdit(); self.p_tipo.setPlaceholderText("Tipo")
+        self.p_status = QLineEdit(); self.p_status.setPlaceholderText("Status")
+        self.p_data = QDateEdit(); self.p_data.setCalendarPopup(True)
+        self.p_data.setDate(self.p_data.date().currentDate())
+        btn_save = QPushButton("Salvar Processo"); btn_save.setStyleSheet("background:#f39c12;color:white;border-radius:6px;height:34px;")
+        btn_save.clicked.connect(self.save_process)
+        for wgt in (self.p_cliente, self.p_num, self.p_tipo, self.p_status, self.p_data, btn_save):
+            form.addWidget(wgt)
+        layout.addLayout(form)
+        actions = QHBoxLayout()
+        btn_edit = QPushButton("Editar selecionado"); btn_delete = QPushButton("Excluir selecionado")
+        btn_edit.clicked.connect(self.edit_process); btn_delete.clicked.connect(self.delete_process)
+        actions.addWidget(btn_edit); actions.addWidget(btn_delete); layout.addLayout(actions)
+        self.tbl_proc = QTableWidget(); self.tbl_proc.setColumnCount(7)
+        self.tbl_proc.setHorizontalHeaderLabels(["ID","Cliente","Número","Tipo","Status","Data Abertura","Descrição"])
+        self.tbl_proc.setAlternatingRowColors(True); layout.addWidget(self.tbl_proc)
+        w.setLayout(layout); self.stacked.addWidget(w)
+        # populate combos and lists - done during refresh_all()
+
+    def load_process_clients_combo(self):
+        """
+        Carrega clientes no combo de processos. NÃO chama a si mesma (corrige recursão).
+        """
+        self.p_cliente.clear()
+        try:
+            conn, cur = conectar(); cur.execute("SELECT id,nome FROM clientes ORDER BY nome")
+            rows = cur.fetchall(); conn.close()
+            for id_, nome in rows:
+                self.p_cliente.addItem(nome, id_)
+        except Exception:
+            pass
+
+    def save_process(self):
+        cliente_id = self.p_cliente.currentData()
+        numero = self.p_num.text().strip()
+        if not numero:
+            QMessageBox.warning(self, "Erro", "Número do processo é obrigatório."); return
+        tipo = self.p_tipo.text().strip(); status = self.p_status.text().strip(); data = self.p_data.date().toString("yyyy-MM-dd")
+        try:
+            conn, cur = conectar()
+            cur.execute("INSERT INTO processos (cliente_id,numero,tipo,status,data_abertura,descricao) VALUES (?,?,?,?,?,?)",
+                        (cliente_id, numero, tipo, status, data, ""))
+            conn.commit(); conn.close()
+            self.p_num.clear(); self.p_tipo.clear(); self.p_status.clear(); self.load_processes(); QMessageBox.information(self, "Sucesso", "Processo salvo.")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", str(e))
+
+    def load_processes(self):
+        conn, cur = conectar()
+        cur.execute("""SELECT p.id, c.nome, p.numero, p.tipo, p.status, p.data_abertura, p.descricao
+                       FROM processos p LEFT JOIN clientes c ON p.cliente_id = c.id
+                       ORDER BY p.data_abertura DESC""")
+        rows = cur.fetchall(); conn.close()
+        self.tbl_proc.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            for j, val in enumerate(r):
+                item = QTableWidgetItem(str(val if val is not None else "")); item.setFlags(item.flags() ^ Qt.ItemIsEditable); self.tbl_proc.setItem(i, j, item)
+        self.tbl_proc.resizeColumnsToContents()
+
+    def edit_process(self):
+        row = self.tbl_proc.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Aviso", "Selecione um processo."); return
+        pid = self.tbl_proc.item(row,0).text()
+        conn, cur = conectar(); cur.execute("SELECT cliente_id,numero,tipo,status,data_abertura,descricao FROM processos WHERE id=?", (pid,)); rec = cur.fetchone(); conn.close()
+        if not rec:
+            QMessageBox.warning(self, "Erro", "Processo não encontrado."); return
+        dlg = QDialog(self); dlg.setWindowTitle("Editar Processo"); dlg.setFixedSize(760,320)
+        v = QVBoxLayout()
+        combo = QComboBox(); self.load_clients_into_combo(combo)
+        for i in range(combo.count()):
+            if combo.itemData(i) == rec[0]:
+                combo.setCurrentIndex(i); break
+        e_num = QLineEdit(rec[1]); e_tipo = QLineEdit(rec[2]); e_status = QLineEdit(rec[3])
+        e_data = QDateEdit(); e_data.setCalendarPopup(True); e_data.setDate(e_data.date().fromString(rec[4], "yyyy-MM-dd"))
+        e_desc = QTextEdit(rec[5] if rec[5] else "")
+        v.addWidget(QLabel("Cliente:")); v.addWidget(combo)
+        v.addWidget(QLabel("Número:")); v.addWidget(e_num)
+        v.addWidget(QLabel("Tipo:")); v.addWidget(e_tipo)
+        v.addWidget(QLabel("Status:")); v.addWidget(e_status)
+        v.addWidget(QLabel("Data Abertura:")); v.addWidget(e_data)
+        v.addWidget(QLabel("Descrição:")); v.addWidget(e_desc)
+        h = QHBoxLayout(); ok = QPushButton("Atualizar"); cancel = QPushButton("Cancelar")
+        ok.clicked.connect(lambda: self.do_update_process(pid, combo.currentData(), e_num.text(), e_tipo.text(), e_status.text(), e_data.date().toString("yyyy-MM-dd"), e_desc.toPlainText(), dlg))
+        cancel.clicked.connect(dlg.reject)
+        h.addWidget(ok); h.addWidget(cancel); v.addLayout(h); dlg.setLayout(v); dlg.exec_()
+
+    def load_clients_into_combo(self, combo):
+        combo.clear()
+        try:
+            conn, cur = conectar(); cur.execute("SELECT id,nome FROM clientes ORDER BY nome")
+            for id_, nome in cur.fetchall(): combo.addItem(nome, id_)
+            conn.close()
+        except:
+            pass
+
+    def do_update_process(self, pid, cliente_id, numero, tipo, status, data, descricao, dlg):
+        if not numero.strip():
+            QMessageBox.warning(dlg, "Erro", "Número obrigatório."); return
+        try:
+            conn, cur = conectar()
+            cur.execute("UPDATE processos SET cliente_id=?, numero=?, tipo=?, status=?, data_abertura=?, descricao=? WHERE id=?",
+                        (cliente_id, numero.strip(), tipo.strip(), status.strip(), data, descricao.strip(), pid))
+            conn.commit(); conn.close(); dlg.accept(); self.load_processes(); QMessageBox.information(self, "Sucesso", "Processo atualizado.")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", str(e))
+
+    def delete_process(self):
+        row = self.tbl_proc.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Aviso", "Selecione um processo."); return
+        pid = self.tbl_proc.item(row,0).text()
+        if QMessageBox.question(self, "Confirmar", "Excluir processo?") != QMessageBox.Yes:
+            return
+        try:
+            conn, cur = conectar(); cur.execute("DELETE FROM processos WHERE id=?", (pid,)); conn.commit(); conn.close(); self.load_processes(); QMessageBox.information(self, "OK", "Processo excluído.")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", str(e))
+
+    # ---------------- Agenda page ----------------
+    def page_agenda(self):
+        w = QWidget(); layout = QVBoxLayout(); layout.setContentsMargins(12,12,12,12)
+        hdr = QLabel("Agenda"); hdr.setFont(QFont("Arial", 16, QFont.Bold)); layout.addWidget(hdr)
+        form = QHBoxLayout()
+        self.a_titulo = QLineEdit(); self.a_titulo.setPlaceholderText("Título")
+        self.a_desc = QTextEdit(); self.a_desc.setPlaceholderText("Descrição")
+        self.a_data = QDateEdit(); self.a_data.setCalendarPopup(True)
+        self.a_hora = QTimeEdit()
+        btn = QPushButton("Salvar"); btn.setStyleSheet("background:#8e44ad;color:white;border-radius:6px;height:34px;")
+        btn.clicked.connect(self.save_agenda)
+        for wgt in (self.a_titulo, self.a_desc, self.a_data, self.a_hora, btn): form.addWidget(wgt)
+        layout.addLayout(form)
+        actions = QHBoxLayout()
+        be = QPushButton("Editar selecionado"); bd = QPushButton("Excluir selecionado")
+        be.clicked.connect(self.edit_agenda); bd.clicked.connect(self.delete_agenda)
+        actions.addWidget(be); actions.addWidget(bd); layout.addLayout(actions)
+        self.tbl_agenda = QTableWidget(); self.tbl_agenda.setColumnCount(4)
+        self.tbl_agenda.setHorizontalHeaderLabels(["Título","Descrição","Data","Hora"]); self.tbl_agenda.setAlternatingRowColors(True)
+        layout.addWidget(self.tbl_agenda); w.setLayout(layout); self.stacked.addWidget(w)
+
+    def save_agenda(self):
+        titulo = self.a_titulo.text().strip(); desc = self.a_desc.toPlainText().strip()
+        data = self.a_data.date().toString("yyyy-MM-dd"); hora = self.a_hora.time().toString("HH:mm")
+        if not titulo:
+            QMessageBox.warning(self, "Erro", "Título obrigatório."); return
+        try:
+            conn, cur = conectar(); cur.execute("INSERT INTO agenda (titulo,descricao,data,hora) VALUES (?,?,?,?)", (titulo, desc, data, hora)); conn.commit(); conn.close(); self.a_titulo.clear(); self.a_desc.clear(); self.load_agenda(); QMessageBox.information(self, "Sucesso", "Compromisso salvo.")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", str(e))
+
+    def load_agenda(self):
+        conn, cur = conectar(); cur.execute("SELECT titulo,descricao,data,hora FROM agenda ORDER BY data DESC"); rows = cur.fetchall(); conn.close()
+        self.tbl_agenda.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            for j, val in enumerate(r):
+                item = QTableWidgetItem(str(val)); item.setFlags(item.flags() ^ Qt.ItemIsEditable); self.tbl_agenda.setItem(i, j, item)
+        self.tbl_agenda.resizeColumnsToContents()
+
+    def edit_agenda(self):
+        row = self.tbl_agenda.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Aviso", "Selecione um compromisso."); return
+        titulo = self.tbl_agenda.item(row,0).text(); data = self.tbl_agenda.item(row,2).text(); hora = self.tbl_agenda.item(row,3).text()
+        conn, cur = conectar(); cur.execute("SELECT id,titulo,descricao,data,hora FROM agenda WHERE titulo=? AND data=? AND hora=? LIMIT 1", (titulo,data,hora)); rec = cur.fetchone(); conn.close()
+        if not rec:
+            QMessageBox.warning(self, "Erro", "Compromisso não encontrado."); return
+        aid = rec[0]; dlg = QDialog(self); dlg.setWindowTitle("Editar Compromisso"); dlg.setFixedSize(700,300)
+        v = QVBoxLayout(); t = QLineEdit(rec[1]); desc = QTextEdit(rec[2]); d = QDateEdit(); d.setCalendarPopup(True); d.setDate(d.date().fromString(rec[3],"yyyy-MM-dd"))
+        time = QTimeEdit(); time.setTime(time.time().fromString(rec[4],"HH:mm"))
+        v.addWidget(QLabel("Título:")); v.addWidget(t); v.addWidget(QLabel("Descrição:")); v.addWidget(desc)
+        v.addWidget(QLabel("Data:")); v.addWidget(d); v.addWidget(QLabel("Hora:")); v.addWidget(time)
+        h = QHBoxLayout(); ok = QPushButton("Atualizar"); cancel = QPushButton("Cancelar")
+        ok.clicked.connect(lambda: self.do_update_agenda(aid, t.text(), desc.toPlainText(), d.date().toString("yyyy-MM-dd"), time.time().toString("HH:mm"), dlg)); cancel.clicked.connect(dlg.reject)
+        h.addWidget(ok); h.addWidget(cancel); v.addLayout(h); dlg.setLayout(v); dlg.exec_()
+
+    def do_update_agenda(self, aid, titulo, desc, data, hora, dlg):
+        if not titulo.strip():
+            QMessageBox.warning(dlg, "Erro", "Título obrigatório."); return
+        try:
+            conn, cur = conectar(); cur.execute("UPDATE agenda SET titulo=?, descricao=?, data=?, hora=? WHERE id=?", (titulo.strip(), desc.strip(), data, hora, aid)); conn.commit(); conn.close(); dlg.accept(); self.load_agenda(); QMessageBox.information(self, "Sucesso", "Compromisso atualizado.")
+        except Exception as e:
+            QMessageBox.critical(dlg, "Erro", str(e))
+
+    def delete_agenda(self):
+        row = self.tbl_agenda.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Aviso", "Selecione um compromisso."); return
+        titulo = self.tbl_agenda.item(row,0).text(); data = self.tbl_agenda.item(row,2).text(); hora = self.tbl_agenda.item(row,3).text()
+        if QMessageBox.question(self, "Confirmar", "Excluir compromisso?") != QMessageBox.Yes:
+            return
+        try:
+            conn, cur = conectar(); cur.execute("DELETE FROM agenda WHERE titulo=? AND data=? AND hora=?", (titulo,data,hora)); conn.commit(); conn.close(); self.load_agenda(); QMessageBox.information(self, "OK", "Compromisso excluído.")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", str(e))
+
+    # ---------------- Finance page ----------------
+    def page_finance(self):
+        w = QWidget(); layout = QVBoxLayout(); layout.setContentsMargins(12,12,12,12)
+        hdr = QLabel("Financeiro"); hdr.setFont(QFont("Arial", 16, QFont.Bold)); layout.addWidget(hdr)
+        form = QHBoxLayout()
+        self.f_desc = QLineEdit(); self.f_desc.setPlaceholderText("Descrição")
+        self.f_tipo = QComboBox(); self.f_tipo.addItems(["Receita","Despesa"])
+        self.f_val = QLineEdit(); self.f_val.setPlaceholderText("Valor (ex: 1200.50)")
+        self.f_data = QDateEdit(); self.f_data.setCalendarPopup(True)
+        btn = QPushButton("Salvar"); btn.setStyleSheet("background:#c0392b;color:white;border-radius:6px;height:34px;")
+        btn.clicked.connect(self.save_fin)
+        for wgt in (self.f_desc, self.f_tipo, self.f_val, self.f_data, btn): form.addWidget(wgt)
+        layout.addLayout(form)
+        actions = QHBoxLayout(); be = QPushButton("Editar selecionado"); bd = QPushButton("Excluir selecionado")
+        be.clicked.connect(self.edit_fin); bd.clicked.connect(self.delete_fin); actions.addWidget(be); actions.addWidget(bd); layout.addLayout(actions)
+        self.tbl_fin = QTableWidget(); self.tbl_fin.setColumnCount(4); self.tbl_fin.setHorizontalHeaderLabels(["Descrição","Tipo","Valor","Data"]); self.tbl_fin.setAlternatingRowColors(True)
+        layout.addWidget(self.tbl_fin); w.setLayout(layout); self.stacked.addWidget(w)
+
+    def save_fin(self):
+        desc = self.f_desc.text().strip(); tipo = self.f_tipo.currentText(); valtxt = self.f_val.text().strip(); date = self.f_data.date().toString("yyyy-MM-dd")
+        if not desc or not valtxt:
+            QMessageBox.warning(self, "Erro", "Preencha descrição e valor."); return
+        try:
+            valor = float(valtxt.replace(",", "."))
+        except:
+            QMessageBox.warning(self, "Erro", "Valor inválido."); return
+        try:
+            conn, cur = conectar(); cur.execute("INSERT INTO financeiro (descricao,tipo,valor,data) VALUES (?,?,?,?)",(desc,tipo,valor,date)); conn.commit(); conn.close(); self.f_desc.clear(); self.f_val.clear(); self.load_fin(); QMessageBox.information(self, "Sucesso", "Registro salvo.")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", str(e))
+
+    def load_fin(self):
+        conn, cur = conectar(); cur.execute("SELECT descricao,tipo,valor,data FROM financeiro ORDER BY data DESC"); rows = cur.fetchall(); conn.close()
+        self.tbl_fin.setRowCount(len(rows))
+        for i,r in enumerate(rows):
+            for j,val in enumerate(r):
+                item = QTableWidgetItem(str(val)); item.setFlags(item.flags() ^ Qt.ItemIsEditable); self.tbl_fin.setItem(i,j,item)
+        self.tbl_fin.resizeColumnsToContents()
+
+    def edit_fin(self):
+        row = self.tbl_fin.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Aviso", "Selecione registro."); return
+        desc = self.tbl_fin.item(row,0).text(); tipo = self.tbl_fin.item(row,1).text(); valor = self.tbl_fin.item(row,2).text(); data = self.tbl_fin.item(row,3).text()
+        conn, cur = conectar(); cur.execute("SELECT id FROM financeiro WHERE descricao=? AND tipo=? AND valor=? AND data=? LIMIT 1", (desc,tipo,valor,data)); rec = cur.fetchone(); conn.close()
+        if not rec:
+            QMessageBox.warning(self, "Erro", "Registro não encontrado."); return
+        fid = rec[0]; dlg = QDialog(self); dlg.setWindowTitle("Editar Financeiro"); dlg.setFixedSize(600,240)
+        v = QVBoxLayout(); e_desc = QLineEdit(desc); e_tipo = QComboBox(); e_tipo.addItems(["Receita","Despesa"]); e_tipo.setCurrentText(tipo)
+        e_val = QLineEdit(valor); e_date = QDateEdit(); e_date.setCalendarPopup(True); e_date.setDate(e_date.date().fromString(data,"yyyy-MM-dd"))
+        v.addWidget(QLabel("Descrição:")); v.addWidget(e_desc); v.addWidget(QLabel("Tipo:")); v.addWidget(e_tipo)
+        v.addWidget(QLabel("Valor:")); v.addWidget(e_val); v.addWidget(QLabel("Data:")); v.addWidget(e_date)
+        h = QHBoxLayout(); ok = QPushButton("Atualizar"); cancel = QPushButton("Cancelar"); ok.clicked.connect(lambda: self.do_update_fin(fid, e_desc.text(), e_tipo.currentText(), e_val.text(), e_date.date().toString("yyyy-MM-dd"), dlg)); cancel.clicked.connect(dlg.reject)
+        h.addWidget(ok); h.addWidget(cancel); v.addLayout(h); dlg.setLayout(v); dlg.exec_()
+
+    def do_update_fin(self, fid, desc, tipo, valtxt, date, dlg):
+        try:
+            valor = float(valtxt.replace(",", "."))
+        except:
+            QMessageBox.warning(dlg, "Erro", "Valor inválido."); return
+        try:
+            conn, cur = conectar(); cur.execute("UPDATE financeiro SET descricao=?, tipo=?, valor=?, data=? WHERE id=?", (desc.strip(), tipo, valor, date, fid)); conn.commit(); conn.close(); dlg.accept(); self.load_fin(); QMessageBox.information(self, "Sucesso", "Atualizado.")
+        except Exception as e:
+            QMessageBox.critical(dlg, "Erro", str(e))
+
+    def delete_fin(self):
+        row = self.tbl_fin.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Aviso", "Selecione registro."); return
+        desc = self.tbl_fin.item(row,0).text(); tipo = self.tbl_fin.item(row,1).text(); val = self.tbl_fin.item(row,2).text(); data = self.tbl_fin.item(row,3).text()
+        if QMessageBox.question(self, "Confirmar", "Excluir registro?") != QMessageBox.Yes:
+            return
+        try:
+            conn, cur = conectar(); cur.execute("DELETE FROM financeiro WHERE descricao=? AND tipo=? AND valor=? AND data=?", (desc,tipo,val,data)); conn.commit(); conn.close(); self.load_fin(); QMessageBox.information(self, "OK", "Removido.")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", str(e))
+
+    # ---------------- Reports page ----------------
+    def page_reports(self):
+        w = QWidget(); layout = QVBoxLayout(); layout.setContentsMargins(12,12,12,12)
+        hdr = QLabel("Relatórios e Exportação"); hdr.setFont(QFont("Arial", 16, QFont.Bold)); layout.addWidget(hdr)
+        row = QHBoxLayout()
+        self.r_type = QComboBox(); self.r_type.addItems(["Clientes","Processos","Financeiro","Agenda"])
+        self.r_from = QDateEdit(); self.r_from.setCalendarPopup(True)
+        self.r_to = QDateEdit(); self.r_to.setCalendarPopup(True)
+        self.r_client_filter = QComboBox(); self.load_clients_filter()
+        btn_pdf = QPushButton("Gerar PDF"); btn_pdf.setStyleSheet("background:#2c3e50;color:white;height:34px;border-radius:6px;"); btn_pdf.clicked.connect(self.generate_pdf)
+        btn_csv = QPushButton("Exportar CSV"); btn_csv.clicked.connect(self.export_csv)
+        btn_xlsx = QPushButton("Exportar Excel (xlsx)"); btn_xlsx.clicked.connect(self.export_xlsx)
+        row.addWidget(QLabel("Tipo:")); row.addWidget(self.r_type); row.addWidget(QLabel("De:")); row.addWidget(self.r_from); row.addWidget(QLabel("Até:")); row.addWidget(self.r_to)
+        row.addWidget(QLabel("Cliente:")); row.addWidget(self.r_client_filter); row.addWidget(btn_pdf); row.addWidget(btn_csv); row.addWidget(btn_xlsx)
+        layout.addLayout(row); w.setLayout(layout); self.stacked.addWidget(w)
+
+    def load_clients_filter(self):
+        try:
+            self.r_client_filter.clear(); self.r_client_filter.addItem("Todos", None)
+            conn, cur = conectar(); cur.execute("SELECT id,nome FROM clientes ORDER BY nome")
+            for id_, nome in cur.fetchall(): self.r_client_filter.addItem(nome, id_)
+            conn.close()
+        except:
+            pass
+
+    def generate_pdf(self):
+        tipo = self.r_type.currentText()
+        path, _ = QFileDialog.getSaveFileName(self, "Salvar PDF", "", "PDF (*.pdf)")
+        if not path:
+            return
+        de = self.r_from.date().toString("yyyy-MM-dd"); ate = self.r_to.date().toString("yyyy-MM-dd")
+        client_filter = self.r_client_filter.currentData()
+        try:
+            c = canvas.Canvas(path, pagesize=A4); largura, altura = A4; y = altura - 60
+            # draw logo if exists
+            if os.path.exists(self.logo_tmp_path):
+                try:
+                    c.drawImage(self.logo_tmp_path, largura - 160, altura - 90, width=120, preserveAspectRatio=True, mask='auto')
+                except Exception:
+                    pass
+            c.setFont("Helvetica-Bold", 14); c.drawString(50, y, f"{FIRM_NAME} — Relatório: {tipo}"); y -= 28; c.setFont("Helvetica", 11)
+            conn, cur = conectar()
+            if tipo == "Clientes":
+                cur.execute("SELECT id,nome,cpf_cnpj,telefone,email,endereco FROM clientes ORDER BY nome")
+                rows = cur.fetchall()
+                for r in rows:
+                    line = f"{r[0]} - {r[1]} - {r[2]} - {r[3]} - {r[4]} - {r[5]}"
+                    c.drawString(50, y, line); y -= 16
+                    if y < 60: c.showPage(); y = altura - 60
+            elif tipo == "Processos":
+                q = """SELECT p.id, c.nome, p.numero, p.tipo, p.status, p.data_abertura, p.descricao
+                       FROM processos p LEFT JOIN clientes c ON p.cliente_id=c.id
+                       WHERE p.data_abertura BETWEEN ? AND ?"""
+                params = [de, ate]
+                if client_filter:
+                    q += " AND p.cliente_id = ?"; params.append(client_filter)
+                q += " ORDER BY p.data_abertura DESC"
+                cur.execute(q, params)
+                for r in cur.fetchall():
+                    line = f"{r[0]} - {r[1]} - Nº:{r[2]} - {r[3]} - {r[4]} - {r[5]}"
+                    c.drawString(50, y, line); y -= 16
+                    if y < 60: c.showPage(); y = altura - 60
+            elif tipo == "Financeiro":
+                cur.execute("SELECT descricao,tipo,valor,data FROM financeiro WHERE data BETWEEN ? AND ? ORDER BY data DESC", (de,ate))
+                for r in cur.fetchall():
+                    line = f"{r[0]} - {r[1]} - R$ {r[2]} - {r[3]}"
+                    c.drawString(50, y, line); y -= 16
+                    if y < 60: c.showPage(); y = altura - 60
+            elif tipo == "Agenda":
+                cur.execute("SELECT titulo,descricao,data,hora FROM agenda WHERE data BETWEEN ? AND ? ORDER BY data DESC", (de,ate))
+                for r in cur.fetchall():
+                    line = f"{r[0]} - {r[1]} - {r[2]} {r[3]}"
+                    c.drawString(50, y, line); y -= 16
+                    if y < 60: c.showPage(); y = altura - 60
+            conn.close(); c.save(); QMessageBox.information(self, "Sucesso", f"PDF gerado: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Falha ao gerar PDF:\n{e}")
+
+    def export_csv(self):
+        tipo = self.r_type.currentText()
+        path, _ = QFileDialog.getSaveFileName(self, "Salvar CSV", "", "CSV (*.csv)")
+        if not path: return
+        de = self.r_from.date().toString("yyyy-MM-dd"); ate = self.r_to.date().toString("yyyy-MM-dd"); client = self.r_client_filter.currentData()
+        try:
+            conn, cur = conectar()
+            rows = []; headers = []
+            if tipo == "Clientes":
+                cur.execute("SELECT id,nome,cpf_cnpj,telefone,email,endereco FROM clientes ORDER BY nome"); rows = cur.fetchall(); headers = ["id","nome","cpf_cnpj","telefone","email","endereco"]
+            elif tipo == "Processos":
+                q = """SELECT p.id, c.nome, p.numero, p.tipo, p.status, p.data_abertura, p.descricao
+                       FROM processos p LEFT JOIN clientes c ON p.cliente_id=c.id
+                       WHERE p.data_abertura BETWEEN ? AND ?"""
+                params=[de,ate]
+                if client:
+                    q += " AND p.cliente_id = ?"; params.append(client)
+                q += " ORDER BY p.data_abertura DESC"; cur.execute(q, params); rows = cur.fetchall(); headers = ["id","cliente","numero","tipo","status","data_abertura","descricao"]
+            elif tipo == "Financeiro":
+                cur.execute("SELECT descricao,tipo,valor,data FROM financeiro WHERE data BETWEEN ? AND ? ORDER BY data DESC",(de,ate)); rows = cur.fetchall(); headers=["descricao","tipo","valor","data"]
+            elif tipo == "Agenda":
+                cur.execute("SELECT titulo,descricao,data,hora FROM agenda WHERE data BETWEEN ? AND ? ORDER BY data DESC",(de,ate)); rows = cur.fetchall(); headers=["titulo","descricao","data","hora"]
+            conn.close()
+            with open(path, "w", newline='', encoding='utf-8') as f:
+                writer = csv.writer(f); writer.writerow(headers)
+                for r in rows: writer.writerow(r)
+            QMessageBox.information(self, "Sucesso", f"CSV salvo: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", str(e))
+
+    def export_xlsx(self):
+        if not HAVE_XLSXWRITER:
+            QMessageBox.warning(self, "Dependência", "xlsxwriter não está instalado. Instale: pip install xlsxwriter")
+            return
+        tipo = self.r_type.currentText()
+        path, _ = QFileDialog.getSaveFileName(self, "Salvar Excel", "", "Excel (*.xlsx)")
+        if not path: return
+        de = self.r_from.date().toString("yyyy-MM-dd"); ate = self.r_to.date().toString("yyyy-MM-dd"); client = self.r_client_filter.currentData()
+        try:
+            conn, cur = conectar()
+            if tipo == "Clientes":
+                cur.execute("SELECT id,nome,cpf_cnpj,telefone,email,endereco FROM clientes ORDER BY nome"); rows = cur.fetchall(); headers = ["ID","Nome","CPF/CNPJ","Telefone","E-mail","Endereço"]
+            elif tipo == "Processos":
+                q = """SELECT p.id, c.nome, p.numero, p.tipo, p.status, p.data_abertura, p.descricao
+                       FROM processos p LEFT JOIN clientes c ON p.cliente_id=c.id
+                       WHERE p.data_abertura BETWEEN ? AND ?"""
+                params=[de,ate]
+                if client:
+                    q += " AND p.cliente_id = ?"; params.append(client)
+                q += " ORDER BY p.data_abertura DESC"; cur.execute(q, params); rows = cur.fetchall(); headers = ["ID","Cliente","Número","Tipo","Status","Data Abertura","Descrição"]
+            elif tipo == "Financeiro":
+                cur.execute("SELECT descricao,tipo,valor,data FROM financeiro WHERE data BETWEEN ? AND ? ORDER BY data DESC",(de,ate)); rows = cur.fetchall(); headers=["Descrição","Tipo","Valor","Data"]
+            elif tipo == "Agenda":
+                cur.execute("SELECT titulo,descricao,data,hora FROM agenda WHERE data BETWEEN ? AND ? ORDER BY data DESC",(de,ate)); rows = cur.fetchall(); headers=["Título","Descrição","Data","Hora"]
+            conn.close()
+            workbook = xlsxwriter.Workbook(path); ws = workbook.add_worksheet("Relatório"); bold = workbook.add_format({'bold': True})
+            for col, h in enumerate(headers): ws.write(0, col, h, bold)
+            for r, row in enumerate(rows, start=1):
+                for c, val in enumerate(row): ws.write(r, c, val)
+            workbook.close(); QMessageBox.information(self, "Sucesso", f"Excel salvo: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", str(e))
+
+    # ---------------- Utilities / Refresh ----------------
+    def refresh_all(self):
+        # ensure DB state then load data
+        ensure_tables_and_columns()
+        ensure_admin_user()
+        self.load_clients()
+        self.load_process_clients_combo()
+        self.load_processes()
+        self.load_agenda()
+        self.load_fin()
+        self.load_clients_filter()
+
+# -------------------------
+# Run
+# -------------------------
+def main():
+    ensure_tables_and_columns()
+    ensure_admin_user()
+    app = QApplication(sys.argv)
+    login = LoginDialog()
+    if login.exec_() == QDialog.Accepted:
+        win = AdvocaciaApp()
+        win.show()
+        sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
